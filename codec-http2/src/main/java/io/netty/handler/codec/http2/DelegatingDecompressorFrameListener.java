@@ -16,17 +16,24 @@ package io.netty.handler.codec.http2;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.compression.Brotli;
 import io.netty.handler.codec.compression.BrotliDecoder;
+import io.netty.handler.codec.compression.DecompressionException;
+import io.netty.handler.codec.compression.JZlibDecoder;
+import io.netty.handler.codec.compression.JdkZlibDecoder;
 import io.netty.handler.codec.compression.Zstd;
 import io.netty.handler.codec.compression.ZstdDecoder;
 import io.netty.handler.codec.compression.ZlibCodecFactory;
+import io.netty.handler.codec.compression.ZlibDecoder;
 import io.netty.handler.codec.compression.ZlibWrapper;
 import io.netty.handler.codec.compression.SnappyFrameDecoder;
+import io.netty.util.internal.PlatformDependent;
+import io.netty.util.internal.SystemPropertyUtil;
 
 import static io.netty.handler.codec.http.HttpHeaderNames.CONTENT_ENCODING;
 import static io.netty.handler.codec.http.HttpHeaderNames.CONTENT_LENGTH;
@@ -49,20 +56,66 @@ import static io.netty.util.internal.ObjectUtil.checkPositiveOrZero;
  */
 public class DelegatingDecompressorFrameListener extends Http2FrameListenerDecorator {
 
+    // Same selection as ZlibCodecFactory, which has no maxAllocation variant of newZlibDecoder(ZlibWrapper).
+    private static final boolean NO_JDK_ZLIB_DECODER = SystemPropertyUtil.getBoolean("io.netty.noJdkZlibDecoder",
+            PlatformDependent.javaVersion() < 7);
+
     private final Http2Connection connection;
     private final boolean strict;
+    private final int maxAllocation;
     private boolean flowControllerInitialized;
     private final Http2Connection.PropertyKey propertyKey;
 
     public DelegatingDecompressorFrameListener(Http2Connection connection, Http2FrameListener listener) {
-        this(connection, listener, true);
+        this(connection, listener, true, 0);
+    }
+
+    /**
+     * Create a new instance.
+     *
+     * @param connection the connection to read data which should be decompressed
+     * @param listener the delegate listener used by {@link Http2FrameListenerDecorator}
+     * @param maxAllocation maximum number of decompressed bytes allowed for a single stream. Must be &gt;= 0.
+     *                      If zero, the decompressed size is not limited. A stream whose decompressed content
+     *                      would exceed this limit is failed with a stream error. The limit is enforced while
+     *                      decompressing: inside the brotli and zstd streaming decoders of this module, by the
+     *                      {@code maxAllocation} of the zlib decoders, and cumulatively across all {@code DATA}
+     *                      frames of the stream.
+     *                      Some compression codecs will output buffers up to 64 KiB in size,
+     *                      even if {@code maxAllocation} is configured lower.
+     */
+    public DelegatingDecompressorFrameListener(Http2Connection connection, Http2FrameListener listener,
+                    int maxAllocation) {
+        this(connection, listener, true, maxAllocation);
     }
 
     public DelegatingDecompressorFrameListener(Http2Connection connection, Http2FrameListener listener,
                     boolean strict) {
+        this(connection, listener, strict, 0);
+    }
+
+    /**
+     * Create a new instance.
+     *
+     * @param connection the connection to read data which should be decompressed
+     * @param listener the delegate listener used by {@link Http2FrameListenerDecorator}
+     * @param strict if {@code true}, {@link ZlibWrapper#ZLIB} will be used for the decoder,
+     *               otherwise the decoder can fallback to {@link ZlibWrapper#NONE}
+     * @param maxAllocation maximum number of decompressed bytes allowed for a single stream. Must be &gt;= 0.
+     *                      If zero, the decompressed size is not limited. A stream whose decompressed content
+     *                      would exceed this limit is failed with a stream error. The limit is enforced while
+     *                      decompressing: inside the brotli and zstd streaming decoders of this module, by the
+     *                      {@code maxAllocation} of the zlib decoders, and cumulatively across all {@code DATA}
+     *                      frames of the stream.
+     *                      Some compression codecs will output buffers up to 64 KiB in size,
+     *                      even if {@code maxAllocation} is configured lower.
+     */
+    public DelegatingDecompressorFrameListener(Http2Connection connection, Http2FrameListener listener,
+                    boolean strict, int maxAllocation) {
         super(listener);
         this.connection = connection;
         this.strict = strict;
+        this.maxAllocation = checkPositiveOrZero(maxAllocation, "maxAllocation");
 
         propertyKey = connection.newKey();
         connection.addListener(new Http2ConnectionAdapter() {
@@ -114,29 +167,60 @@ public class DelegatingDecompressorFrameListener extends Http2FrameListenerDecor
     protected EmbeddedChannel newContentDecompressor(final ChannelHandlerContext ctx, CharSequence contentEncoding)
             throws Http2Exception {
         if (GZIP.contentEqualsIgnoreCase(contentEncoding) || X_GZIP.contentEqualsIgnoreCase(contentEncoding)) {
-            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-                    ctx.channel().config(), ZlibCodecFactory.newZlibDecoder(ZlibWrapper.GZIP));
+            return newDecompressorChannel(ctx, newZlibDecoder(ZlibWrapper.GZIP));
         }
         if (DEFLATE.contentEqualsIgnoreCase(contentEncoding) || X_DEFLATE.contentEqualsIgnoreCase(contentEncoding)) {
             final ZlibWrapper wrapper = strict ? ZlibWrapper.ZLIB : ZlibWrapper.ZLIB_OR_NONE;
             // To be strict, 'deflate' means ZLIB, but some servers were not implemented correctly.
-            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-                    ctx.channel().config(), ZlibCodecFactory.newZlibDecoder(wrapper));
+            return newDecompressorChannel(ctx, newZlibDecoder(wrapper));
         }
         if (Brotli.isAvailable() && BR.contentEqualsIgnoreCase(contentEncoding)) {
-            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-              ctx.channel().config(), new BrotliDecoder());
+            if (maxAllocation == 0) {
+                return newDecompressorChannel(ctx, new BrotliDecoder());
+            }
+            // Enforce the limit inside the decoder, while decompressing.
+            return newDecompressorChannel(ctx, new BoundedBrotliDecoder(maxAllocation));
         }
         if (SNAPPY.contentEqualsIgnoreCase(contentEncoding)) {
-            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-                    ctx.channel().config(), new SnappyFrameDecoder());
+            return newDecompressorChannel(ctx, new SnappyFrameDecoder());
         }
         if (Zstd.isAvailable() && ZSTD.contentEqualsIgnoreCase(contentEncoding)) {
-            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-                    ctx.channel().config(), new ZstdDecoder());
+            if (maxAllocation == 0) {
+                return newDecompressorChannel(ctx, new ZstdDecoder());
+            }
+            // Enforce the limit inside the decoder, while decompressing.
+            return newDecompressorChannel(ctx, new BoundedZstdDecoder(maxAllocation));
         }
         // 'identity' or unsupported
         return null;
+    }
+
+    /**
+     * Returns a new zlib decoder for the given {@code wrapper}. When {@code maxAllocation > 0} the decoder caps the
+     * buffer it inflates a single input into at {@code maxAllocation} bytes and fails once that is exhausted.
+     */
+    private ZlibDecoder newZlibDecoder(ZlibWrapper wrapper) {
+        if (maxAllocation == 0) {
+            return ZlibCodecFactory.newZlibDecoder(wrapper);
+        }
+        if (PlatformDependent.javaVersion() < 7 || NO_JDK_ZLIB_DECODER) {
+            return new JZlibDecoder(wrapper, maxAllocation);
+        }
+        return new JdkZlibDecoder(wrapper, true, maxAllocation);
+    }
+
+    /**
+     * Build the per-stream {@link EmbeddedChannel} that performs decompression. When {@code maxAllocation > 0} a
+     * {@link DecompressionLimiter} is appended after the decoder so the decompressed output of the whole stream,
+     * which may be spread over many {@code DATA} frames, is bounded as well.
+     */
+    private EmbeddedChannel newDecompressorChannel(final ChannelHandlerContext ctx, ChannelHandler decoder) {
+        if (maxAllocation > 0) {
+            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
+                    ctx.channel().config(), decoder, new DecompressionLimiter(maxAllocation));
+        }
+        return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
+                ctx.channel().config(), decoder);
     }
 
     /**
@@ -208,6 +292,43 @@ public class DelegatingDecompressorFrameListener extends Http2FrameListenerDecor
 
     Http2Decompressor decompressor(Http2Stream stream) {
         return stream == null ? null : (Http2Decompressor) stream.getProperty(propertyKey);
+    }
+
+    /**
+     * Inbound handler appended after the decoder inside the per-stream decompression {@link EmbeddedChannel}.
+     * It tracks the cumulative number of decompressed bytes of the stream and fails it once {@code maxAllocation} is
+     * exceeded, so a stream cannot get around the limit by spreading its content over many small {@code DATA}
+     * frames. The exception is reported by {@link EmbeddedChannel#writeInbound(Object...)} and turned into a stream
+     * error; any output the decoder still forwards afterwards is released without being delivered.
+     */
+    private static final class DecompressionLimiter extends ChannelInboundHandlerAdapter {
+        private final int maxAllocation;
+        private long decompressedBytes;
+        private boolean limitExceeded;
+
+        DecompressionLimiter(int maxAllocation) {
+            this.maxAllocation = maxAllocation;
+        }
+
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+            if (msg instanceof ByteBuf) {
+                ByteBuf buf = (ByteBuf) msg;
+                if (limitExceeded) {
+                    // The stream has already failed, drop whatever the decoder still produces.
+                    buf.release();
+                    return;
+                }
+                decompressedBytes += buf.readableBytes();
+                if (decompressedBytes > maxAllocation) {
+                    limitExceeded = true;
+                    buf.release();
+                    throw new DecompressionException(
+                            "Decompression buffer has reached maximum size: " + maxAllocation);
+                }
+            }
+            ctx.fireChannelRead(msg);
+        }
     }
 
     /**

@@ -1,8 +1,29 @@
 [
   {
+    "name": "io.netty.handler.codec.http2.BoundedBrotliDecoder",
+    "condition": {
+      "typeReachable": "io.netty.handler.codec.http2.BoundedBrotliDecoder"
+    },
+    "queryAllPublicMethods": true
+  },
+  {
+    "name": "io.netty.handler.codec.http2.BoundedZstdDecoder",
+    "condition": {
+      "typeReachable": "io.netty.handler.codec.http2.BoundedZstdDecoder"
+    },
+    "queryAllPublicMethods": true
+  },
+  {
     "name": "io.netty.handler.codec.http2.CleartextHttp2ServerUpgradeHandler",
     "condition": {
       "typeReachable": "io.netty.handler.codec.http2.CleartextHttp2ServerUpgradeHandler"
+    },
+    "queryAllPublicMethods": true
+  },
+  {
+    "name": "io.netty.handler.codec.http2.DelegatingDecompressorFrameListener$DecompressionLimiter",
+    "condition": {
+      "typeReachable": "io.netty.handler.codec.http2.DelegatingDecompressorFrameListener$DecompressionLimiter"
     },
     "queryAllPublicMethods": true
   },
